@@ -98,6 +98,7 @@ function ensureFreshConnectionInfo({
 // BEGIN CONTACT FIELD CONSTANTS
 const CONTACT_PHONE_TYPES = ["work", "home", "mobile", "fax", "pager"];
 const CONTACT_ADDRESS_TYPES = ["home", "work"];
+const CONTACT_EMAIL_TYPES = ["work", "home"];
 const CONTACT_ADDRESS_FIELDS = [
   "poBox",
   "street2",
@@ -179,6 +180,42 @@ function getContactPhoneType(entry) {
 
 function getContactAddressType(entry) {
   return getContactVCardTypes(entry).includes("home") ? "home" : "work";
+}
+
+// Unlike phones and addresses, an EMAIL entry often has no type; "" keeps it
+// untyped instead of defaulting to "work".
+function getContactEmailType(entry) {
+  return getContactVCardTypes(entry).find(type => CONTACT_EMAIL_TYPES.includes(type)) || "";
+}
+
+/**
+ * EMAIL entries in Thunderbird's order of preference: PREF first (1 is the
+ * primary address), then the position of the entries, as in
+ * VCardProperties.getAllEntriesSorted(), which AddrBookCard.primaryEmail uses.
+ */
+function sortContactEmailEntries(entries) {
+  let nextPref = 101;
+  return entries
+    .map(entry => ({ entry, pref: parseInt(entry.params?.pref, 10) || nextPref++ }))
+    .sort((a, b) => a.pref - b.pref)
+    .map(item => item.entry);
+}
+
+/**
+ * All email addresses of a card, primary first, from nsIAbCard.emailAddresses;
+ * a card without that attribute falls back to its two legacy properties.
+ */
+function getContactEmailAddresses(card) {
+  let addresses;
+  try {
+    addresses = card.emailAddresses;
+  } catch {
+    // Not implemented by this card: use the legacy properties below.
+  }
+  if (!Array.isArray(addresses)) {
+    addresses = [card.primaryEmail, getContactCardProperty(card, "SecondEmail")];
+  }
+  return addresses.filter(address => typeof address === "string" && address);
 }
 
 function isContactLeapYear(year) {
@@ -274,6 +311,14 @@ function getContactCardProperty(card, name) {
 
 function readVCardContactFields(card) {
   const vCardProperties = card.vCardProperties;
+  const emails = sortContactEmailEntries(vCardProperties.getAllEntries("email"))
+    .map(entry => {
+      const address = contactValueToString(entry.value).trim();
+      const type = getContactEmailType(entry);
+      return type ? { type, address } : { address };
+    })
+    .filter(email => email.address);
+
   const phones = vCardProperties.getAllEntries("tel").map(entry => ({
     type: getContactPhoneType(entry),
     number: normalizeContactPhoneValue(entry.value),
@@ -300,6 +345,7 @@ function readVCardContactFields(card) {
   const birthdayValue = contactValueToString(vCardProperties.getFirstValue("bday"));
 
   return {
+    emails,
     phones,
     addresses,
     organization,
@@ -310,6 +356,12 @@ function readVCardContactFields(card) {
 }
 
 function readFlatContactFields(card) {
+  // Legacy cards store at most a primary and a second address, without types.
+  const emails = [card.primaryEmail, getContactCardProperty(card, "SecondEmail")]
+    .map(value => contactValueToString(value).trim())
+    .filter(Boolean)
+    .map(address => ({ address }));
+
   const phones = [];
   for (const type of CONTACT_PHONE_TYPES) {
     const number = getContactCardProperty(card, CONTACT_PHONE_FLAT_PROPERTIES[type]);
@@ -339,6 +391,7 @@ function readFlatContactFields(card) {
   }
 
   return {
+    emails,
     phones,
     addresses,
     organization: getContactCardProperty(card, "Company"),
@@ -366,6 +419,7 @@ function formatContact(card, book) {
     id: card.UID,
     displayName: card.displayName || "",
     email: card.primaryEmail || "",
+    emails: details.emails,
     firstName: card.firstName || "",
     lastName: card.lastName || "",
     phones: details.phones,
@@ -385,7 +439,8 @@ function contactFieldsHaveContent(fields) {
   )) {
     return true;
   }
-  return (Array.isArray(fields.phones) && fields.phones.length > 0) ||
+  return (Array.isArray(fields.emails) && fields.emails.length > 0) ||
+    (Array.isArray(fields.phones) && fields.phones.length > 0) ||
     (Array.isArray(fields.addresses) && fields.addresses.length > 0);
 }
 
@@ -397,6 +452,33 @@ function validateContactFields(fields, requireContent = false) {
   for (const name of CONTACT_SCALAR_FIELDS) {
     if (fields[name] !== undefined && typeof fields[name] !== "string") {
       return `${name} must be a string`;
+    }
+  }
+
+  if (fields.emails !== undefined) {
+    if (!Array.isArray(fields.emails)) return "emails must be an array";
+    const seenAddresses = new Set();
+    for (let i = 0; i < fields.emails.length; i++) {
+      const email = fields.emails[i];
+      if (!email || typeof email !== "object" || Array.isArray(email)) {
+        return `emails[${i}] must be an object`;
+      }
+      const unknown = Object.keys(email).find(key => !["type", "address"].includes(key));
+      if (unknown) return `Unknown emails[${i}] property: ${unknown}`;
+      if (email.type !== undefined && !CONTACT_EMAIL_TYPES.includes(email.type)) {
+        return `emails[${i}].type must be one of: ${CONTACT_EMAIL_TYPES.join(", ")}`;
+      }
+      if (typeof email.address !== "string" || !email.address.trim()) {
+        return `emails[${i}].address must be a non-empty string`;
+      }
+      const key = email.address.trim().toLowerCase();
+      if (seenAddresses.has(key)) return `emails[${i}].address repeats an earlier address`;
+      seenAddresses.add(key);
+    }
+    // emails sets the primary address too, so email may only restate it.
+    const primary = fields.emails.length ? fields.emails[0].address.trim() : "";
+    if (fields.email !== undefined && fields.email.trim() !== primary) {
+      return "email must equal emails[0].address when both are given";
     }
   }
 
@@ -522,8 +604,13 @@ function reconcileVCardContactEntries(vCardProperties, name, items, config) {
     if (!retainedEntries.has(entry)) vCardProperties.removeEntry(entry);
   }
   for (let i = 0; i < items.length; i++) {
-    if (!matchedEntries[i]) vCardProperties.addEntry(config.createEntry(items[i]));
+    if (!matchedEntries[i]) {
+      matchedEntries[i] = config.createEntry(items[i]);
+      vCardProperties.addEntry(matchedEntries[i]);
+    }
   }
+  // The entry of each item, in item order.
+  return matchedEntries;
 }
 
 function normalizeContactPhoneValue(value) {
@@ -569,6 +656,9 @@ function getDuplicateContactType(items) {
 function getFlatContactCollectionError(card, fields) {
   if (card.supportsVCard) return null;
 
+  if (Array.isArray(fields.emails) && fields.emails.length > 2) {
+    return "Non-vCard contact cards support at most two email addresses (primary and second)";
+  }
   const duplicatePhoneType = getDuplicateContactType(fields.phones);
   if (duplicatePhoneType) {
     return `Non-vCard contact cards support only one phone number per type; duplicate phone type "${duplicatePhoneType}" is not supported`;
@@ -582,6 +672,32 @@ function getFlatContactCollectionError(card, fields) {
 
 function applyVCardContactFields(card, fields, VCardPropertyEntry) {
   const vCardProperties = card.vCardProperties;
+
+  if (fields.emails !== undefined) {
+    const entries = reconcileVCardContactEntries(vCardProperties, "email", fields.emails, {
+      getEntryType: getContactEmailType,
+      getItemType: email => email.type || "",
+      getEntryValue: entry => contactValueToString(entry.value).trim(),
+      getItemValue: email => email.address.trim(),
+      updateEntry: (entry, email) => {
+        entry.value = email.address.trim();
+      },
+      createEntry: email => new VCardPropertyEntry(
+        "email",
+        email.type ? { type: email.type } : {},
+        "text",
+        email.address.trim()
+      ),
+    });
+    // Thunderbird ranks addresses by PREF, then by position: make the first
+    // address the only preferred one and store the others in the given order.
+    for (const entry of entries) vCardProperties.removeEntry(entry);
+    entries.forEach((entry, index) => {
+      if (index === 0) entry.params.pref = "1";
+      else delete entry.params.pref;
+      vCardProperties.addEntry(entry);
+    });
+  }
 
   if (fields.phones !== undefined) {
     reconcileVCardContactEntries(vCardProperties, "tel", fields.phones, {
@@ -637,6 +753,11 @@ function applyVCardContactFields(card, fields, VCardPropertyEntry) {
 }
 
 function applyFlatContactFields(card, fields) {
+  if (fields.emails !== undefined) {
+    card.primaryEmail = fields.emails[0]?.address.trim() || "";
+    card.setProperty("SecondEmail", fields.emails[1]?.address.trim() || "");
+  }
+
   if (fields.phones !== undefined) {
     for (const property of Object.values(CONTACT_PHONE_FLAT_PROPERTIES)) {
       card.setProperty(property, "");
@@ -674,7 +795,9 @@ function applyContactFields(card, fields, VCardPropertyEntry) {
   const flatCollectionError = getFlatContactCollectionError(card, fields);
   if (flatCollectionError) return { error: flatCollectionError };
 
-  if (fields.email !== undefined) {
+  // emails replaces every address, the primary included; validation keeps
+  // email equal to its first entry, so email needs no separate write then.
+  if (fields.email !== undefined && fields.emails === undefined) {
     if (supportsVCard && fields.email === "") {
       card.vCardProperties.clearValues("email");
     } else {
@@ -700,6 +823,7 @@ function shouldSynthesizePhoneDisplayName(fields) {
   )) {
     return false;
   }
+  if (Array.isArray(fields.emails) && fields.emails.length > 0) return false;
   return !Array.isArray(fields.addresses) || fields.addresses.length === 0;
 }
 // END CONTACT FIELD HELPERS
@@ -1991,7 +2115,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         required: ["email"],
       };
       const contactFieldProperties = {
-        email: { type: "string", description: "Primary email address. May be omitted for phone-only contacts." },
+        email: { type: "string", description: "Primary email address. On update, a non-empty value replaces the current primary address and keeps the others. May be omitted for phone-only contacts." },
+        emails: {
+          type: "array",
+          description: "All email addresses, primary first. On update, replaces the email collection; use [] to clear it. If email is also given, it must equal the first address. Cards that are not vCard-backed keep at most two addresses and no types.",
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string", enum: CONTACT_EMAIL_TYPES, description: "Email type (omit for an untyped address)" },
+              address: { type: "string", description: "Email address" },
+            },
+            required: ["address"],
+            additionalProperties: false,
+          },
+        },
         displayName: { type: "string", description: "Display name" },
         firstName: { type: "string", description: "First name" },
         lastName: { type: "string", description: "Last name" },
@@ -2381,11 +2518,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "searchContacts",
         group: "contacts", crud: "read",
         title: "Search Contacts",
-        description: "Search contacts across all address books by email address or name",
+        description: "Search contacts across all address books by any of their email addresses or by name",
         inputSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "Email address or name to search for" },
+            query: { type: "string", description: "Email address or name to search for; matches every address of a contact" },
             maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200). If truncated, response includes hasMore: true." },
           },
           required: ["query"],
@@ -5592,11 +5729,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 for (const card of book.childCards) {
                   if (card.isMailList) continue;
 
-                  const email = (card.primaryEmail || "").toLowerCase();
+                  const emails = getContactEmailAddresses(card)
+                    .map(address => address.toLowerCase());
                   const displayName = (card.displayName || "").toLowerCase();
                   const firstName = (card.firstName || "").toLowerCase();
                   const lastName = (card.lastName || "").toLowerCase();
-                  const fields = [email, displayName, firstName, lastName];
+                  const fields = [...emails, displayName, firstName, lastName];
 
                   if (failedQuery) continue;
                   const matches = !hasQuery || queryTokens.every(token =>
@@ -5648,6 +5786,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function createContact(
               email,
+              emails,
               displayName,
               firstName,
               lastName,
@@ -5662,6 +5801,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               try {
                 const fields = {
                   email,
+                  emails,
                   displayName,
                   firstName,
                   lastName,
@@ -5724,6 +5864,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function updateContact(
               contactId,
               email,
+              emails,
               displayName,
               firstName,
               lastName,
@@ -5740,6 +5881,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 const fields = {
                   email,
+                  emails,
                   displayName,
                   firstName,
                   lastName,
@@ -11350,9 +11492,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "getContact":
                   return getContact(args.contactId);
                 case "createContact":
-                  return createContact(args.email, args.displayName, args.firstName, args.lastName, args.phones, args.addresses, args.organization, args.title, args.note, args.birthday, args.addressBookId);
+                  return createContact(args.email, args.emails, args.displayName, args.firstName, args.lastName, args.phones, args.addresses, args.organization, args.title, args.note, args.birthday, args.addressBookId);
                 case "updateContact":
-                  return updateContact(args.contactId, args.email, args.displayName, args.firstName, args.lastName, args.phones, args.addresses, args.organization, args.title, args.note, args.birthday);
+                  return updateContact(args.contactId, args.email, args.emails, args.displayName, args.firstName, args.lastName, args.phones, args.addresses, args.organization, args.title, args.note, args.birthday);
                 case "deleteContact":
                   return deleteContact(args.contactId);
                 case "listCalendars":
